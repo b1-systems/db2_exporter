@@ -11,10 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-kit/kit/log/level"
 	"github.com/BurntSushi/toml"
 	_ "github.com/ibmdb/go_ibm_db"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/log"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/promlog"
 )
 
 var (
@@ -27,6 +29,7 @@ var (
 	customMetrics      = flag.String("custom.metrics", os.Getenv("CUSTOM_METRICS"), "File that may contain various custom metrics in a TOML file.")
 	queryTimeout       = flag.String("query.timeout", "5", "Query timeout (in seconds).")
 	db2dsn             = flag.String("dsn", os.Getenv("DB_DSN"), "Default DSN:DATABASE=sample; HOSTNAME=localhost; PORT=60000; PROTOCOL=TCPIP; UID=db2inst1; PWD=db2inst1;")
+	logger             = promlog.New(&promlog.Config{})
 )
 
 // Metric name parts.
@@ -71,7 +74,7 @@ type Exporter struct {
 func NewExporter(dsn string) *Exporter {
 	db, err := sql.Open("go_ibm_db", dsn)
 	if err != nil {
-		log.Errorln("Error while connecting to", dsn)
+		level.Error(logger).Log("msg","Error while connecting to", "dsn", dsn)
 		panic(err)
 	}
 	return &Exporter{
@@ -153,19 +156,19 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	// Noop function for simple SELECT 1 FROM SYSIBM.SYSDUMMY1
 	noop := func(row map[string]string) error { return nil }
 	if err = GeneratePrometheusMetrics(e.db, noop, "SELECT 1 FROM SYSIBM.SYSDUMMY1"); err != nil {
-		log.Errorln("Error pinging DB2:", err)
+		level.Error(logger).Log("msg","Error pinging DB2:", "error", err)
 		// close old connection
 		e.db.Close()
 		// Maybe DB2 instance was restarted => try to reconnect
-		log.Infoln("Try to reconnect...")
+		level.Info(logger).Log("msg","Try to reconnect...")
 		e.db, err = sql.Open("go_ibm_db", e.dsn)
 		if err != nil {
-			log.Errorln("Error while connecting to DB2:", err)
+			level.Error(logger).Log("msg","Error while connecting to DB2:", "error", err)
 			e.up.Set(0)
 			return
 		}
 		if err = GeneratePrometheusMetrics(e.db, noop, "SELECT 1 FROM SYSIBM.SYSDUMMY1"); err != nil {
-			log.Error("Unable to connect to DB2:", err)
+			level.Error(logger).Log("msg","Unable to connect to DB2:", "err", err)
 			e.up.Set(0)
 			return
 		}
@@ -174,7 +177,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	for _, metric := range metricsToScrap.Metric {
 		if err = ScrapeMetric(e.db, ch, metric); err != nil {
-			log.Errorln("Error scraping for", metric.Context, ":", err)
+			level.Error(logger).Log("msg","Error scraping for", "context", metric.Context, "error", err)
 			e.scrapeErrors.WithLabelValues(metric.Context).Inc()
 		}
 	}
@@ -220,7 +223,7 @@ func ScrapeGenericValues(db *sql.DB, ch chan<- prometheus.Metric, context string
 		//debug
 
 		//fmt.Println("label-debug", labelsValues)
-		log.Debugln("label:", labelsValues)
+		level.Debug(logger).Log("label", labelsValues)
 		// Construct Prometheus values to sent back
 		for metric, metricHelp := range metricsDesc {
 			metric = strings.ToLower(metric)
@@ -228,7 +231,7 @@ func ScrapeGenericValues(db *sql.DB, ch chan<- prometheus.Metric, context string
 
 			//debug
 			//fmt.Println("metric-debug", metric, " ", value)
-			log.Debugln("metric:", metric, " ", value)
+			level.Debug(logger).Log("metric", metric, "value", value)
 
 			// If not a float, skip current metric
 			if err != nil {
@@ -272,7 +275,7 @@ func GeneratePrometheusMetrics(db *sql.DB, parse func(row map[string]string) err
 	// Add a timeout
 	timeout, err := strconv.Atoi(*queryTimeout)
 	if err != nil {
-		log.Fatal("error while converting timeout option value: ", err)
+		level.Error(logger).Log("msg", "error while converting timeout option value: ", "err", err)
 		panic(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
@@ -314,7 +317,7 @@ func GeneratePrometheusMetrics(db *sql.DB, parse func(row map[string]string) err
 		}
 
 		// fmt.Println(m)
-		log.Debugln(m)
+		level.Debug(logger).Log("msg", m)
 		// Call function to parse row
 		if err := parse(m); err != nil {
 			return err
@@ -337,33 +340,33 @@ func cleanName(s string) string {
 
 func main() {
 	flag.Parse()
-	log.Infoln("Starting ibmdb2_exporter " + Version)
+	level.Info(logger).Log("msg","Starting ibmdb2_exporter ", "version", Version)
 	dsn := *db2dsn
 	if dsn == "" {
 		dsn = "DATABASE=sample; HOSTNAME=localhost; PORT=60000; PROTOCOL=TCPIP; UID=db2inst1; PWD=db2inst1;"
-		log.Infoln("With default DSN config. To change it set ENV DB2_DSN or -dsn flag.")
+		level.Info(logger).Log("msg","With default DSN config. To change it set ENV DB2_DSN or -dsn flag.")
 	}
-	log.Infoln("Running with DB2_DSN=", dsn)
+	level.Info(logger).Log("msg","Running with DB2_DSN=", "dsn", dsn)
 	// Load default metrics
 	if _, err := toml.DecodeFile(*defaultFileMetrics, &metricsToScrap); err != nil {
-		log.Errorln(err)
+		level.Error(logger).Log("msg",err)
 		panic(errors.New("Error while loading " + *defaultFileMetrics))
 	}
 
 	// If custom metrics, load it
 	if strings.Compare(*customMetrics, "") != 0 {
 		if _, err := toml.DecodeFile(*customMetrics, &additionalMetrics); err != nil {
-			log.Errorln(err)
+			level.Error(logger).Log("msg",err)
 			panic(errors.New("Error while loading " + *customMetrics))
 		}
 		metricsToScrap.Metric = append(metricsToScrap.Metric, additionalMetrics.Metric...)
 	}
 	exporter := NewExporter(dsn)
 	prometheus.MustRegister(exporter)
-	http.Handle(*metricPath, prometheus.Handler())
+	http.Handle(*metricPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write(landingPage)
 	})
-	log.Infoln("Listening on", *listenAddress)
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	level.Info(logger).Log("msg","Listening on", "listen_address", *listenAddress)
+	level.Error(logger).Log(http.ListenAndServe(*listenAddress, nil))
 }
